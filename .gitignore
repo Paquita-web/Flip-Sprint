@@ -1,0 +1,12 @@
+# Archivo de secretos locales. ¡NUNCA SUBIR A GITHUB!
+.env
+
+# Archivos de caché y logs de Python
+__pycache__/
+*.pyc
+
+# Logs de servicios y directorios de Node-RED
+logs/
+flows/node-red-data/
+
+
