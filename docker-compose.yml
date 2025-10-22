@@ -19,5 +19,32 @@ services:
     ports:
       - "1883:1883"
 
+# 1. Servicio de Alonso (Necesario para el HOST: 'alonso-api')
+  alonso-api:
+    build: .
+    container_name: greendelivery_api
+    command: python scripts/api_ingesta.py # O el comando real que use Alonso
+    ports:
+      - "8000:8000"
+    environment:
+      # Alonso necesita esto para conectarse a la DB
+      - DB_HOST=postgres
+      # ... (otras variables)
+    depends_on:
+      - postgres
+
+  # 2. Tu Servicio (Paquita - E3)
+  paquita-processor:
+    build: .
+    container_name: greendelivery_processor
+    command: python scripts/processor.py # Comando para ejecutar tu script
+    environment:
+      # ESTO ES LO CRÍTICO: La URL interna usa el nombre del servicio
+      - API_INGEST_URL=http://alonso-api:8000/ingest 
+      - MQTT_HOST=mosquitto # Tu script necesita el host MQTT
+    depends_on:
+      - mosquitto
+      - alonso-api # Asegura que la API se inicie antes que tu procesador
+
 volumes:
   postgres_data:
