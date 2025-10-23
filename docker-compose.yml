@@ -33,7 +33,7 @@ services:
     depends_on:
       - postgres
 
-  # 2. Tu Servicio (Paquita - E3)
+  # 2. Servicio de Alejandra
   paquita-processor:
     build: .
     container_name: greendelivery_processor
