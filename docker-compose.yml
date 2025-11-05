@@ -1,50 +1,181 @@
-version: '3.8'
+import requests
+import paho.mqtt.client as mqtt
+import json
+import time
+import os
+from dotenv import load_dotenv
 
-services:
-  postgres:
-    image: postgres:14-alpine
-    container_name: greendelivery_db
-    environment:
-      POSTGRES_USER: ${DB_USER}
-      POSTGRES_PASSWORD: ${DB_PASSWORD}
-      POSTGRES_DB: ${DB_NAME}
-    ports:
-      - "5432:5432"
-    volumes:
-      - postgres_data:/var/lib/postgresql/data/
+# Cargar variables de entorno
+load_dotenv()
 
-  mosquitto:
-    image: eclipse-mosquitto
-    container_name: greendelivery_mqtt_broker
-    ports:
-      - "1883:1883"
+# --- CONFIGURACIÓN CRÍTICA ---
+MQTT_BROKER = os.getenv("MQTT_HOST", "mosquitto")
+MQTT_PORT = int(os.getenv("MQTT_PORT", 1883))
+MQTT_TOPIC = "greendelivery/rubia/telemetry"
 
-# 1. Servicio de Alonso (Necesario para el HOST: 'alonso-api')
-  alonso-api:
-    build: .
-    container_name: greendelivery_api
-    command: python scripts/api_ingesta.py # O el comando real que use Alonso
-    ports:
-      - "8000:8000"
-    environment:
-      # Alonso necesita esto para conectarse a la DB
-      - DB_HOST=postgres
-      # ... (otras variables)
-    depends_on:
-      - postgres
+# --- CONFIGURACIÓN DE RESILIENCIA (Cap. 5) ---
+API_INGEST_URL = os.getenv("API_INGEST_URL", "http://alonso-api:8000/ingest")
+DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL") # Nueva variable
+MAX_RETRIES = 5
 
-  # 2. Tu Servicio (Paquita - E3)
-  paquita-processor:
-    build: .
-    container_name: greendelivery_processor
-    command: python scripts/processor.py # Comando para ejecutar tu script
-    environment:
-      # ESTO ES LO CRÍTICO: La URL interna usa el nombre del servicio
-      - API_INGEST_URL=http://alonso-api:8000/ingest 
-      - MQTT_HOST=mosquitto # Tu script necesita el host MQTT
-    depends_on:
-      - mosquitto
-      - alonso-api # Asegura que la API se inicie antes que tu procesador
+# --- Umbrales del Negocio (Cap. 3) ---
+TEMP_UMBRAL = 8.0  # Regla de negocio: SI temperatura > 8.0 °C
+G_FORCE_UMBRAL = 2.5 # Regla ML sencilla: SI fuerza_g > 2.5 G
+CONSECUTIVE_EVENTS = 3 # Lógica Stateful: Sostenida durante N eventos
 
-volumes:
-  postgres_data:
+# Diccionario Global para mantener la memoria del estado de cada envío
+# Estado: {'consecutive': int, 'is_alerting': bool}
+package_state = {}
+
+
+# --- FUNCIONES DE ACCIÓN (Cap. 4) ---
+
+def send_discord_alert(data, reason):
+    """Envía un mensaje de alerta a Discord usando el Webhook."""
+    if not DISCORD_WEBHOOK_URL:
+        print("❌ ERROR: La URL de Discord no está configurada. No se pudo enviar la alerta.")
+        return
+
+    # Construcción del payload JSON para Discord (Embed)
+    payload = {
+        "content": "@here 🚨 **ALERTA CRÍTICA SOSTENIDA** 🚨",
+        "embeds": [{
+            "title": f"Envío {data.get('id_paquete')} - Incidente Detectado",
+            "description": f"Razón: **{reason}**.\nCondición anómala mantenida por {CONSECUTIVE_EVENTS} eventos.",
+            "color": 16711680, # Color Rojo
+            "fields": [
+                {"name": "Temperatura", "value": f"{data.get('temperatura', 'N/A')} °C", "inline": True},
+                {"name": "Fuerza G", "value": f"{data.get('fuerza_g_ejez', 'N/A')} G", "inline": True},
+                {"name": "Timestamp", "value": data.get('timestamp', 'N/A'), "inline": False}
+            ]
+        }]
+    }
+
+    try:
+        response = requests.post(DISCORD_WEBHOOK_URL, json=payload)
+        response.raise_for_status()
+        print(f"✅ Notificación enviada a Discord para {data.get('id_paquete')}.")
+    except requests.exceptions.RequestException as e:
+        print(f"❌ Error al enviar la alerta a Discord: {e}")
+
+
+# --- FUNCIÓN DE RESILIENCIA (Cap. 5) ---
+
+def send_to_ingest_api(data, max_retries=MAX_RETRIES):
+    """Implementa la Resiliencia: Envía datos a la API con reintentos y backoff."""
+    retries = 0
+    while retries < max_retries:
+        try:
+            # Petición POST a la API de Alonso
+            response = requests.post(API_INGEST_URL, json=data, timeout=5)
+            response.raise_for_status()
+
+            print(f"🟢 Éxito: Dato {data.get('id_paquete')} insertado correctamente.")
+            return
+
+        except requests.exceptions.RequestException as e:
+            retries += 1
+            # Añadido log para la Boss Fight
+            print(f"❌ Fallo de API/Red (Intento {retries}/{max_retries}): {e} [REINTENTANDO]")
+
+            if retries < max_retries:
+                # Retardo Exponencial (Backoff)
+                wait_time = 2 ** retries
+                time.sleep(wait_time)
+            else:
+                # Fallo crítico y pérdida de dato (solo en este prototipo)
+                print(f"❌❌ FALLO CRÍTICO: Se agotaron los reintentos. Dato {data.get('id_paquete')} **PERDIDO**.")
+                return 
+
+
+# --- LÓGICA DEL CEREBRO (Cap. 3) ---
+
+def process_telemetry(data):
+    """Aplica la lógica de estado y umbrales a cada dato."""
+    global package_state
+
+    temp = data.get('temperatura_c', 99.9) # Corregido: asumimos 'temperatura_c' de DDL
+    g_force = data.get('fuerza_g_ejez', 0.0) # Añadido G-Force
+    package_id = data.get('id_paquete', 'N/A')
+
+    # 1. Validación inicial del estado
+    if package_id not in package_state:
+        package_state[package_id] = {'consecutive': 0, 'is_alerting': False}
+
+    # 2. ¿El evento actual es malo? (Regla de negocio + ML sencillo)
+    is_temp_alert = temp > TEMP_UMBRAL
+    is_g_force_alert = g_force > G_FORCE_UMBRAL
+    is_alert_event = is_temp_alert or is_g_force_alert
+    
+    # Razón de la alerta para el mensaje de Discord
+    reason = ""
+    if is_temp_alert and is_g_force_alert:
+        reason = "Temperatura y Posible Impacto"
+    elif is_temp_alert:
+        reason = "Temperatura Excedida"
+    elif is_g_force_alert:
+        reason = "Posible Impacto Sostenido"
+
+
+    if is_alert_event:
+        package_state[package_id]['consecutive'] += 1
+
+        if package_state[package_id]['consecutive'] >= CONSECUTIVE_EVENTS:
+            
+            # Solo enviar alerta a Discord si no se ha alertado ya (throttling)
+            if not package_state[package_id]['is_alerting']:
+                # ALERTA CRÍTICA SOSTENIDA
+                print(f"🚨🚨 ALERTA CRÍTICA SOSTENIDA: {package_id} - Razón: {reason}. Enviando a Discord.")
+                send_discord_alert(data, reason)
+                package_state[package_id]['is_alerting'] = True # Bloqueamos futuras alertas hasta que se normalice
+        
+        else:
+            # Pico temporal
+            print(f"🌡️ Advertencia: Pico temporal ({reason}). Contador: {package_state[package_id]['consecutive']}/{CONSECUTIVE_EVENTS}")
+
+    else:
+        # Dato bueno, reseteamos el contador y el estado de alerta
+        if package_state[package_id]['consecutive'] > 0:
+            print(f"🟢 Reseteando alerta de {package_id}. Volvió a la normalidad.")
+        
+        package_state[package_id]['consecutive'] = 0
+        package_state[package_id]['is_alerting'] = False # Permitimos que se dispare la alerta de nuevo
+
+
+    # ⬇️ TAREA: Llamar a la función de envío resiliente para persistir el dato
+    send_to_ingest_api(data)
+
+
+# --- FUNCIONES MQTT y INICIO DEL SERVICIO (Sin cambios) ---
+
+def on_connect(client, userdata, flags, rc):
+    """Callback que se ejecuta al conectar con el Broker."""
+    if rc == 0:
+        print("Conexión MQTT exitosa. Suscribiéndose...")
+        client.subscribe(MQTT_TOPIC)
+    else:
+        print(f"Fallo en la conexión MQTT. Código: {rc}")
+
+def on_message(client, userdata, msg):
+    """Callback que se ejecuta al recibir un mensaje."""
+    try:
+        data = json.loads(msg.payload.decode('utf-8'))
+        # Se asume que el payload tiene 'temperatura_c', 'fuerza_g_ejez', 'id_paquete', 'timestamp'
+        process_telemetry(data)
+    except json.JSONDecodeError:
+        print("Error: Mensaje JSON inválido.")
+    except Exception as e:
+        print(f"Error al procesar mensaje: {e}")
+
+
+if __name__ == "__main__":
+    client = mqtt.Client()
+    client.on_connect = on_connect
+    client.on_message = on_message
+
+    try:
+        print(f"Procesador: Intentando conectar a {MQTT_BROKER}:{MQTT_PORT}")
+        client.connect(MQTT_BROKER, MQTT_PORT, 60)
+        client.loop_forever()
+    except Exception as e:
+        print(f"Error fatal de conexión: {e}")
