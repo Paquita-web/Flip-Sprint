@@ -32,19 +32,26 @@ services:
       # ... (otras variables)
     depends_on:
       - postgres
+version: '3.8'
 
-  # 2. Servicio de Alejandra
+services:
+  # ... servicios postgres, mosquitto y alonso-api sin cambios ...
+
+  # 2. Servicio de Alejandra (paquita-processor)
   paquita-processor:
     build: .
     container_name: greendelivery_processor
     command: python scripts/processor.py # Comando para ejecutar tu script
     environment:
-      # ESTO ES LO CRÍTICO: La URL interna usa el nombre del servicio
-      - API_INGEST_URL=http://alonso-api:8000/ingest 
-      - MQTT_HOST=mosquitto # Tu script necesita el host MQTT
+      # VARIABLES YA EXISTENTES
+      - API_INGEST_URL=http://alonso-api:8000/ingest  
+      - MQTT_HOST=mosquitto 
+      
+      # 🚀 NUEVA VARIABLE: Se inyecta la URL del webhook desde el .env
+      - DISCORD_WEBHOOK_URL=${DISCORD_WEBHOOK_URL} 
     depends_on:
       - mosquitto
-      - alonso-api # Asegura que la API se inicie antes que tu procesador
+      - alonso-api
 
 volumes:
   postgres_data:
