@@ -1,11 +1,12 @@
 import requests
+import subprocess 
 import paho.mqtt.client as mqtt
 import json
 import time
 import os
 from dotenv import load_dotenv
 
-# Cargar variables de entorno (Importante para Docker y variables .env)
+# Cargar variables de entorno
 load_dotenv()
 
 # --- CONFIGURACIÓN CRÍTICA ---
@@ -50,8 +51,9 @@ def send_to_ingest_api(data, max_retries=MAX_RETRIES):
                 print(f"⏳ Reintentando en {wait_time} segundos...")
                 time.sleep(wait_time)
             else:
-                # Fallo crítico y alerta SRE (Corregido el print final)
+                # Fallo crítico y alerta SRE
                 print(f"❌❌ FALLO CRÍTICO: Se agotaron los reintentos. Dato {data.get('id_paquete')} perdido.")
+                return 
 
 
 # --- LÓGICA DEL CEREBRO (ISSUE #4 INTEGRADO CON #5) ---
@@ -91,7 +93,7 @@ def process_telemetry(data):
     send_to_ingest_api(data)
 
 
-# --- FUNCIONES MQTT y INICIO DEL SERVICIO (Sin cambios) ---
+# --- FUNCIONES MQTT y INICIO DEL SERVICIO ---
 
 def on_connect(client, userdata, flags, rc):
     """Callback que se ejecuta al conectar con el Broker."""
