@@ -18,11 +18,12 @@ services:
     container_name: greendelivery_mqtt_broker
     ports:
       - "1883:1883"
+    # El simulador y el procesador se conectarán a 'mosquitto' internamente
 
   alonso-api:
     build: .
     container_name: greendelivery_api
-    command: python scripts/api_ingesta.py 
+    command: python scripts/api_ingesta.py
     ports:
       - "8000:8000"
     environment:
@@ -31,23 +32,30 @@ services:
     depends_on:
       - postgres
 
-  # 2. Servicio de Alejandra (paquita-processor)
   paquita-processor:
     build: .
     container_name: greendelivery_processor
     command: python scripts/processor.py
     environment:
-      - API_INGEST_URL=http://alonso-api:8000/ingest  
-      - MQTT_HOST=mosquitto 
-      
-      # 🚀 NUEVAS VARIABLES INYECTADAS DESDE .env:
-      # Se asume que este es el Webhook para las alertas de TEMPERATURA
-      - DISCORD_WEBHOOK_TEMP=${DISCORD_WEBHOOK_TEMP} 
-      # Se incluye el Webhook de la Puerta por si lo usas en el script del procesador
-      - DISCORD_WEBHOOK_DOOR=${DISCORD_WEBHOOK_DOOR} 
+      - API_INGEST_URL=http://alonso-api:8000/ingest
+      - MQTT_HOST=mosquitto
+      # Webhooks inyectados para las alertas de Discord
+      - DISCORD_WEBHOOK_TEMP=${DISCORD_WEBHOOK_TEMP}
+      - DISCORD_WEBHOOK_DOOR=${DISCORD_WEBHOOK_DOOR}
     depends_on:
       - mosquitto
       - alonso-api
+
+  # 🚀 NUEVO SERVICIO: El Simulador IoT 
+  simulador_envio:
+    build: .
+    container_name: greendelivery_simulador_test
+    # 🎯 Comando para ejecutar tu script de sensores:
+    # Se usa --broker mosquitto (el nombre del servicio)
+    # Se usa --topic-root greendelivery/rubia para el topic MQTT
+    command: python sensores_envio.py --broker mosquitto --topic-root greendelivery/rubia --id-paquete PKG-ALERTA-001
+    depends_on:
+      - mosquitto # El broker debe estar vivo para que el simulador envíe datos
 
 volumes:
   postgres_data:
