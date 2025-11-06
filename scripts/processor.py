@@ -1,5 +1,4 @@
 import requests
-import subprocess 
 import paho.mqtt.client as mqtt
 import json
 import time
@@ -14,30 +13,75 @@ MQTT_BROKER = os.getenv("MQTT_HOST", "mosquitto")
 MQTT_PORT = int(os.getenv("MQTT_PORT", 1883))
 MQTT_TOPIC = "greendelivery/rubia/telemetry"
 
-# --- CONFIGURACIÓN DE RESILIENCIA (ISSUE #5) ---
-API_INGEST_URL = os.getenv("API_INGEST_URL", "http://localhost:8000/ingest")
+# --- CONFIGURACIÓN DE RESILIENCIA Y ACCIÓN (Cap. 5 & 4) ---
+API_INGEST_URL = os.getenv("API_INGEST_URL", "http://alonso-api:8000/ingest")
+DISCORD_WEBHOOK_TEMP = os.getenv("DISCORD_WEBHOOK_TEMP") # Webhook para #sensor-temperatura
+DISCORD_WEBHOOK_DOOR = os.getenv("DISCORD_WEBHOOK_DOOR") # Webhook para #sensor-puerta
 MAX_RETRIES = 5
 
-# Umbrales del Negocio (Seguridad de la Carne)
-TEMP_UMBRAL = 4.0
-CONSECUTIVE_EVENTS = 3
+# --- Umbrales del Negocio (Cap. 3) ---
+TEMP_UMBRAL = 8.0  # El enunciado original pide > 8.0°C
+G_FORCE_UMBRAL = float(os.getenv("G_FORCE_UMBRAL", 2.5)) # Añadido G-Force desde .env
+CONSECUTIVE_EVENTS = 3 # Lógica Stateful: Sostenida durante N eventos
 
 # Diccionario Global para mantener la memoria del estado de cada envío
+# Estado: {'consecutive': int, 'is_alerting_temp': bool, 'is_alerting_door': bool}
 package_state = {}
 
 
-# --- FUNCIÓN DE RESILIENCIA (ISSUE #5) ---
+# --- FUNCIONES DE ACCIÓN (Discord Webhooks) ---
+
+def send_discord_alert(data, reason, webhook_url):
+    """Envía un mensaje de alerta a Discord usando el Webhook específico."""
+    if not webhook_url:
+        print(f"❌ ERROR: URL de Discord para {reason} no configurada. Alerta no enviada.")
+        return
+
+    # Definir propiedades visuales según la razón
+    if "Temperatura" in reason:
+        color_code = 16711680  # Rojo
+        alert_title = "🌡️ ALERTA CRÍTICA DE TEMPERATURA"
+    elif "Puerta Abierta" in reason:
+        color_code = 16776960  # Amarillo
+        alert_title = "🚪 ALERTA OPERACIONAL DE PUERTA"
+    else:
+        color_code = 65535 # Azul
+        alert_title = "🚨 ALERTA GENERAL"
+
+    # Construcción del payload JSON para Discord (Embed)
+    payload = {
+        "content": "@here",
+        "embeds": [{
+            "title": f"{alert_title}: {data.get('id_paquete')}",
+            "description": f"Razón: **{reason}**.\nRevisión inmediata requerida.",
+            "color": color_code,
+            "fields": [
+                {"name": "Temperatura", "value": f"{data.get('temperatura', 'N/A')} °C", "inline": True},
+                {"name": "Puerta Abierta", "value": str(data.get('puerta_abierta', 'N/A')), "inline": True},
+                {"name": "Fuerza G", "value": f"{data.get('fuerza_g', 'N/A')} G", "inline": False},
+                {"name": "Timestamp", "value": data.get('timestamp_utc', 'N/A'), "inline": False}
+            ]
+        }]
+    }
+
+    try:
+        response = requests.post(webhook_url, json=payload)
+        response.raise_for_status()
+        print(f"✅ Notificación enviada a Discord ({reason}).")
+    except requests.exceptions.RequestException as e:
+        print(f"❌ Error al enviar la alerta a Discord: {e}")
+
+
+# --- FUNCIÓN DE RESILIENCIA (Cap. 5) ---
 
 def send_to_ingest_api(data, max_retries=MAX_RETRIES):
     """Implementa la Resiliencia: Envía datos a la API con reintentos y backoff."""
     retries = 0
     while retries < max_retries:
         try:
-            # Petición POST a la API de Alonso (E1)
+            # Petición POST a la API de Alonso
             response = requests.post(API_INGEST_URL, json=data, timeout=5)
             response.raise_for_status()
-
-            # Corregido el print de éxito
             print(f"🟢 Éxito: Dato {data.get('id_paquete')} insertado correctamente.")
             return
 
@@ -51,45 +95,83 @@ def send_to_ingest_api(data, max_retries=MAX_RETRIES):
                 print(f"⏳ Reintentando en {wait_time} segundos...")
                 time.sleep(wait_time)
             else:
-                # Fallo crítico y alerta SRE
                 print(f"❌❌ FALLO CRÍTICO: Se agotaron los reintentos. Dato {data.get('id_paquete')} perdido.")
                 return 
 
 
-# --- LÓGICA DEL CEREBRO (ISSUE #4 INTEGRADO CON #5) ---
+# --- LÓGICA DEL CEREBRO (Cap. 3 - Detección Múltiple) ---
 
 def process_telemetry(data):
     """Aplica la lógica de estado y umbrales a cada dato."""
     global package_state
-
+    
+    # Adaptación a las claves del nuevo simulador
     temp = data.get('temperatura', 99.9)
+    g_force = data.get('fuerza_g', 0.0) # Usando 'fuerza_g' del nuevo simulador
+    puerta_abierta = data.get('puerta_abierta', False) # Nuevo sensor
     package_id = data.get('id_paquete', 'N/A')
 
-    # 1. ¿El evento actual es malo?
-    is_alert_event = temp > TEMP_UMBRAL
-
+    # Inicializar/Actualizar estado del paquete
     if package_id not in package_state:
-        package_state[package_id] = 0
+        package_state[package_id] = {'consecutive': 0, 'is_alerting_temp': False, 'is_alerting_door': False}
 
-    if is_alert_event:
-        package_state[package_id] += 1
+    state = package_state[package_id]
+    
+    # ----------------------------------------------------
+    # Detección 1: Alerta de Puerta Abierta (INMEDIATA)
+    # ----------------------------------------------------
+    if puerta_abierta:
+        if not state['is_alerting_door']:
+            # Enviar alerta solo la primera vez que se detecta el estado
+            reason = "Puerta Abierta por Manipulación"
+            print(f"🚨 PUERTA: {package_id} - {reason}. Enviando a Discord.")
+            send_discord_alert(data, reason, DISCORD_WEBHOOK_DOOR)
+            state['is_alerting_door'] = True # Bloqueamos para throttling
+    else:
+        # Resetear el throttling si la puerta se cierra
+        if state['is_alerting_door']:
+            print(f"🟢 PUERTA: {package_id} - Puerta cerrada. Reseteando alerta.")
+        state['is_alerting_door'] = False
+        
+    # ----------------------------------------------------
+    # Detección 2: Alerta de Temperatura/Impacto (SOSTENIDA)
+    # ----------------------------------------------------
+    is_temp_alert = temp > TEMP_UMBRAL
+    is_g_force_alert = g_force > G_FORCE_UMBRAL # Detección de impacto
+    is_alert_event_sostenido = is_temp_alert or is_g_force_alert
+    
+    reason_sostenida = ""
+    if is_temp_alert and is_g_force_alert:
+        reason_sostenida = "Temperatura y Posible Impacto"
+    elif is_temp_alert:
+        reason_sostenida = "Temperatura Excedida"
+    elif is_g_force_alert:
+        reason_sostenida = "Posible Impacto Sostenido"
 
-        if package_state[package_id] >= CONSECUTIVE_EVENTS:
-            # ALERTA CRÍTICA SOSTENIDA (Corregido el print)
-            print(f"🚨🚨 ALERTA CRÍTICA: {package_id} - Temp {temp}°C SOSTENIDA. Requiere acción.")
-            # TODO: Aquí irá la llamada al webhook (futuro)
+
+    if is_alert_event_sostenido:
+        state['consecutive'] += 1
+
+        if state['consecutive'] >= CONSECUTIVE_EVENTS:
+            # Solo enviar alerta a Discord si no se ha alertado ya (throttling)
+            if not state['is_alerting_temp']:
+                print(f"🚨 TEMP/G-FORCE: {package_id} - {reason_sostenida} SOSTENIDA. Enviando a Discord.")
+                send_discord_alert(data, reason_sostenida, DISCORD_WEBHOOK_TEMP)
+                state['is_alerting_temp'] = True # Bloqueamos futuras alertas
+        
         else:
-            # Pico temporal (Corregido el print)
-            print(f"🌡️ Advertencia: Pico temporal. Contador: {package_state[package_id]}/{CONSECUTIVE_EVENTS}")
+            print(f"🌡️ Advertencia: Pico temporal ({reason_sostenida}). Contador: {state['consecutive']}/{CONSECUTIVE_EVENTS}")
 
     else:
-        # Dato bueno, reseteamos el contador
-        if package_state[package_id] > 0:
-            # Reseteando alerta (Corregido el print)
-            print(f"🟢 Reseteando alerta de {package_id}. Volvió a la normalidad.")
-        package_state[package_id] = 0
+        # Dato bueno, reseteamos el contador y el estado de alerta
+        if state['consecutive'] > 0:
+            print(f"🟢 TEMP/G-FORCE: {package_id} - Volvió a la normalidad. Reseteando contador.")
+        
+        state['consecutive'] = 0
+        state['is_alerting_temp'] = False # Permitimos que se dispare la alerta de nuevo
 
-    # ⬇️ TAREA DEL ISSUE #5: Llamar a la función de envío resiliente
+
+    # ⬇️ TAREA: Llamar a la función de envío resiliente para persistir el dato
     send_to_ingest_api(data)
 
 
