@@ -65,44 +65,6 @@ Evaluación (Paso 3):
 Script de Python/Pandas para aplicar la lógica de  eventos al labels.csv.
 Calcular la Matriz de Confusión y el Recall (y F1-Score) de vuestra regla.
 
-4. KPIs y Valor para el Negocio (Capítulo 4) 
 
-Entregable: Dashboard en Looker Studio/Grafana/Metabase conectado a PostgreSQL.
-KPI a Visualizar
-Pregunta de Negocio
-Tipo de Visualización
-Justificación/Cálculo
-1. % Envíos en SLA
-¿Estamos cumpliendo la promesa de calidad?
-Tarjeta numérica grande (Gauge)
-COUNT(envíos sin alertas) / COUNT(total de envíos).
-2. Tiempo Medio de Detección (MTTD)
-¿Cuánto tardamos en reaccionar?
-Tarjeta o Histograma
-AVG(Timestamp Alerta - Timestamp 1er Evento Anómalo).
-3. % Falsos Positivos
-¿Se fían nuestros operarios de las alertas?
-Gráfico de barras o Tarjeta
-COUNT(Alertas Marcadas Falsas) / COUNT(Alertas Totales).
-
-
-5. Seguridad por Diseño y Boss Fight (Capítulo 5) 
-
-Entregable: security/CIA_minithreats.md y demostración de resiliencia.
-Principio CIA
-Amenaza de Seguridad/Fallo
-Mitigación Implementada
-Confidencialidad (C)
-Credenciales de DB/API expuestas en el código.
-Usar archivo .env y añadirlo a .gitignore. El código lee del entorno. Rotación de claves.
-Integridad (I)
-Datos maliciosos/mal formados (ej. Temp ).
-Validación de Tipos y Rango en la API de ingesta (ej. usando Pydantic en FastAPI). Rechazo de peticiones inválidas con código 422.
-Disponibilidad (A)
-Caída de la Base de Datos o la API.
-Reintentos con Backoff Exponencial en el flujo de ingesta para almacenar datos temporalmente.
-Boss Fight
-Caída de la DB durante 60 segundos.
-Demostrar que el sistema almacena los datos en buffer (memoria/cola) durante la caída y los inserta automáticamente una vez la DB se restablece, sin perder eventos.
 
 
